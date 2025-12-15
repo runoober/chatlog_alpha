@@ -14,6 +14,7 @@ import (
 	"github.com/sjzar/chatlog/internal/chatlog/database"
 	"github.com/sjzar/chatlog/internal/chatlog/http"
 	"github.com/sjzar/chatlog/internal/chatlog/wechat"
+	"github.com/sjzar/chatlog/internal/model"
 	iwechat "github.com/sjzar/chatlog/internal/wechat"
 	"github.com/sjzar/chatlog/pkg/config"
 	"github.com/sjzar/chatlog/pkg/util"
@@ -296,9 +297,28 @@ func (m *Manager) StartAutoDecrypt() error {
 	if m.ctx.DataKey == "" || m.ctx.DataDir == "" {
 		return fmt.Errorf("请先获取密钥")
 	}
+
+	// 尝试运行一次解密，验证环境和密钥是否正常
+	// 如果解密失败，说明配置或环境有问题，不应开启自动解密
+	if err := m.DecryptDBFiles(); err != nil {
+		return fmt.Errorf("初始解密失败，无法开启自动解密: %w", err)
+	}
+
 	if m.ctx.WorkDir == "" {
 		return fmt.Errorf("请先执行解密数据")
 	}
+
+	m.wechat.SetAutoDecryptErrorHandler(func(err error) {
+		log.Error().Err(err).Msg("自动解密失败，停止服务")
+		m.StopAutoDecrypt()
+
+		if m.app != nil {
+			m.app.QueueUpdateDraw(func() {
+				m.app.showError(fmt.Errorf("自动解密失败，已停止服务: %v", err))
+				m.app.updateMenuItemsState()
+			})
+		}
+	})
 
 	if err := m.wechat.StartAutoDecrypt(); err != nil {
 		return err
@@ -332,6 +352,20 @@ func (m *Manager) RefreshSession() error {
 	}
 	m.ctx.LastSession = resp.Items[0].NTime
 	return nil
+}
+
+func (m *Manager) GetLatestSession() (*model.Session, error) {
+	if m.db == nil || m.db.GetDB() == nil {
+		return nil, nil
+	}
+	resp, err := m.db.GetSessions("", 1, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Items) > 0 {
+		return resp.Items[0], nil
+	}
+	return nil, nil
 }
 
 func (m *Manager) CommandKey(configPath string, pid int, force bool, showXorKey bool) (string, error) {

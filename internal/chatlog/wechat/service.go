@@ -29,6 +29,7 @@ type Service struct {
 	pendingActions map[string]bool
 	mutex          sync.Mutex
 	fm             *filemonitor.FileMonitor
+	errorHandler   func(error)
 }
 
 type Config interface {
@@ -45,6 +46,11 @@ func NewService(conf Config) *Service {
 		lastEvents:     make(map[string]time.Time),
 		pendingActions: make(map[string]bool),
 	}
+}
+
+// SetAutoDecryptErrorHandler sets the callback for auto decryption errors
+func (s *Service) SetAutoDecryptErrorHandler(handler func(error)) {
+	s.errorHandler = handler
 }
 
 // GetWeChatInstances returns all running WeChat instances
@@ -145,7 +151,11 @@ func (s *Service) waitAndProcess(dbFile string) {
 			s.mutex.Unlock()
 
 			log.Debug().Msgf("Processing file: %s", dbFile)
-			s.DecryptDBFile(dbFile)
+			if err := s.DecryptDBFile(dbFile); err != nil {
+				if s.errorHandler != nil {
+					s.errorHandler(err)
+				}
+			}
 			return
 		}
 		s.mutex.Unlock()
@@ -203,11 +213,20 @@ func (s *Service) DecryptDBFiles() error {
 		return err
 	}
 
+	var lastErr error
+	failCount := 0
+
 	for _, dbFile := range dbFiles {
 		if err := s.DecryptDBFile(dbFile); err != nil {
 			log.Debug().Msgf("DecryptDBFile %s failed: %v", dbFile, err)
+			lastErr = err
+			failCount++
 			continue
 		}
+	}
+
+	if len(dbFiles) > 0 && failCount == len(dbFiles) {
+		return fmt.Errorf("decryption failed for all %d files, last error: %w", len(dbFiles), lastErr)
 	}
 
 	return nil

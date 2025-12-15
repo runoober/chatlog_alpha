@@ -188,6 +188,15 @@ func (a *App) refresh() {
 				a.infoBar.UpdateAutoDecrypt("[未开启]")
 			}
 
+			// Update latest message in footer
+			if session, err := a.m.GetLatestSession(); err == nil && session != nil {
+				sender := session.NickName
+				if sender == "" {
+					sender = session.UserName
+				}
+				a.footer.UpdateLatestMessage(sender, session.NTime.Format("15:04:05"), session.Content)
+			}
+
 			a.Draw()
 		}
 	}

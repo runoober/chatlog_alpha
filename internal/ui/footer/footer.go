@@ -15,17 +15,19 @@ const (
 
 type Footer struct {
 	*tview.Flex
-	title     string
-	copyRight *tview.TextView
-	help      *tview.TextView
+	title         string
+	copyRight     *tview.TextView
+	help          *tview.TextView
+	latestMessage *tview.TextView
 }
 
 func New() *Footer {
 	footer := &Footer{
-		Flex:      tview.NewFlex(),
-		title:     Title,
-		copyRight: tview.NewTextView(),
-		help:      tview.NewTextView(),
+		Flex:          tview.NewFlex(),
+		title:         Title,
+		copyRight:     tview.NewTextView(),
+		help:          tview.NewTextView(),
+		latestMessage: tview.NewTextView(),
 	}
 
 	footer.copyRight.
@@ -39,7 +41,7 @@ func New() *Footer {
 	footer.help.
 		SetDynamicColors(true).
 		SetWrap(true).
-		SetTextAlign(tview.AlignRight)
+		SetTextAlign(tview.AlignCenter)
 	footer.help.
 		SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
 
@@ -52,9 +54,17 @@ func New() *Footer {
 		style.GetColorHex(style.MenuBgColor), style.GetColorHex(style.PageHeaderFgColor),
 	)
 
+	footer.latestMessage.
+		SetDynamicColors(true).
+		SetWrap(false).
+		SetTextAlign(tview.AlignRight)
+	footer.latestMessage.
+		SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+
 	footer.
 		AddItem(footer.copyRight, 0, 1, false).
-		AddItem(footer.help, 0, 1, false)
+		AddItem(footer.help, 0, 2, false).
+		AddItem(footer.latestMessage, 0, 2, false)
 
 	return footer
 }
@@ -65,4 +75,17 @@ func (f *Footer) SetCopyRight(text string) {
 
 func (f *Footer) SetHelp(text string) {
 	f.help.SetText(text)
+}
+
+func (f *Footer) UpdateLatestMessage(sender, time, content string) {
+	runes := []rune(content)
+	if len(runes) > 15 {
+		content = string(runes[:15]) + "..."
+	}
+	// [颜色]发送人 [颜色]时间 [颜色]内容
+	text := fmt.Sprintf("[%s]%s [%s]%s [%s]%s",
+		style.GetColorHex(style.PageHeaderFgColor), sender,
+		style.GetColorHex(style.InfoBarItemFgColor), time,
+		style.GetColorHex(style.FgColor), content)
+	f.latestMessage.SetText(text)
 }
