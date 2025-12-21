@@ -71,6 +71,7 @@ type FileCopyManager struct {
 	cancel       context.CancelFunc // Cancel function for graceful shutdown
 	wg           sync.WaitGroup     // WaitGroup for goroutine synchronization
 	cacheSize    int64              // Current number of cached entries (atomic)
+	locks        sync.Map           // Locks for concurrent file copies: key -> *sync.Mutex
 }
 
 // FileIndexEntry represents an indexed temporary file with comprehensive metadata.
@@ -749,6 +750,13 @@ func (fm *FileCopyManager) cleanupOrphanedFilesInternal() {
 	}
 }
 
+// getLock returns or creates a mutex for the specified key.
+// This ensures that concurrent operations for the same file are serialized.
+func (fm *FileCopyManager) getLock(key string) *sync.Mutex {
+	v, _ := fm.locks.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 // GetTempCopy creates or retrieves a temporary copy of the specified file.
 // It provides persistent caching with instance-based isolation.
 //
@@ -800,30 +808,65 @@ func (fm *FileCopyManager) GetTempCopy(originalPath string) (string, error) {
 	// Use unified cache key generation
 	cacheKey := fm.generateCacheKey(fm.instanceID, baseName, ext, currentHash, expectedDataHash)
 
-	var oldTempPath string // Track old file to delete after successful creation
-	if value, exists := fm.fileIndex.Load(cacheKey); exists {
-		entry := value.(*FileIndexEntry)
-		// Found cached file, verify it still exists and matches
-		if _, err := os.Stat(entry.TempPath); err == nil && currentSize == entry.Size {
-			// File exists and size matches, reuse cached copy
-			entry.SetLastAccess(now)            // Update access time atomically
-			entry.SetOriginalPath(originalPath) // Update original path thread-safely
-			return entry.TempPath, nil
-		} else {
-			// Cached file is missing or size mismatch, remove from index
-			fm.fileIndex.Delete(cacheKey)
-			atomic.AddInt64(&fm.cacheSize, -1)
-			if err == nil {
-				// File exists but size mismatch, mark for cleanup
-				oldTempPath = entry.TempPath
+	// Helper function to check cache
+	checkCache := func() (string, bool) {
+		if value, exists := fm.fileIndex.Load(cacheKey); exists {
+			entry := value.(*FileIndexEntry)
+			// Found cached file, verify it still exists and matches
+			if _, err := os.Stat(entry.TempPath); err == nil && currentSize == entry.Size {
+				// File exists and size matches, reuse cached copy
+				entry.SetLastAccess(now)            // Update access time atomically
+				entry.SetOriginalPath(originalPath) // Update original path thread-safely
+				return entry.TempPath, true
+			} else {
+				// Cached file is missing or size mismatch, remove from index
+				fm.fileIndex.Delete(cacheKey)
+				atomic.AddInt64(&fm.cacheSize, -1)
+				if err == nil {
+					// File exists but size mismatch, mark for cleanup
+					// We can't safely clean it here if we are going to create a new one with same key?
+					// Actually cacheKey includes dataHash. If size mismatch, dataHash SHOULD be different.
+					// But if we are here, it means cacheKey matched.
+					// So collision? Or file modified on disk?
+					// In any case, we remove it.
+					// Note: We don't delete synchronously here to avoid race, async worker handles it.
+					select {
+					case fm.deletionChan <- entry.TempPath:
+					default:
+						// Channel full, try synchronous delete if possible or ignore
+					}
+				}
 			}
 		}
+		return "", false
+	}
+
+	// First check (Fast Path)
+	if path, ok := checkCache(); ok {
+		return path, nil
+	}
+
+	// Slow Path: Acquire lock and double check
+	lock := fm.getLock(cacheKey)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Double Check (after acquiring lock)
+	if path, ok := checkCache(); ok {
+		return path, nil
 	}
 
 	// Strategy 2: No valid cached file found, create new one
 	tempPath := fm.generateTempPath(originalPath)
 
 	// Before creating new copy, clean up old versions of the same file
+	// Note: cleaning up old versions might race with other locks if they lock on different cacheKeys?
+	// cleanupOldVersions uses versionKey (without dataHash).
+	// If we lock on cacheKey (with dataHash), we allow concurrent creation of DIFFERENT versions.
+	// This is acceptable. cleanupOldVersions handles its own safety via fileIndex iteration?
+	// cleanupOldVersions iterates and deletes. It might delete something being used?
+	// It only deletes if dataHash != currentDataHash.
+	// So it won't delete what WE are building (since we match currentDataHash).
 	fm.cleanupOldVersions(baseName, ext, currentHash, expectedDataHash)
 
 	// Perform atomic file copy
@@ -850,16 +893,6 @@ func (fm *FileCopyManager) GetTempCopy(originalPath string) (string, error) {
 	// Check if cache size exceeds limit and trigger cleanup if needed
 	if atomic.LoadInt64(&fm.cacheSize) > MaxCacheEntries {
 		go fm.performCacheCleanup()
-	}
-
-	// Clean up old version after successful creation to prevent race conditions
-	if oldTempPath != "" {
-		select {
-		case fm.deletionChan <- oldTempPath:
-		default:
-			// Channel full, delete synchronously as fallback
-			os.Remove(oldTempPath)
-		}
 	}
 
 	return tempPath, nil
@@ -966,6 +999,14 @@ func (fm *FileCopyManager) atomicCopyFile(src, dst string) error {
 
 	// Atomic rename to final destination
 	if err = os.Rename(tempDst, dst); err != nil {
+		// If rename failed, check if the destination file already exists
+		if _, statErr := os.Stat(dst); statErr == nil {
+			// Destination exists, likely created by a concurrent process.
+			// We can consider this a success (reuse existing file).
+			// Clean up our temporary file since we don't need it.
+			os.Remove(tempDst)
+			return nil
+		}
 		return fmt.Errorf("failed to rename temporary file: %w", err)
 	}
 
